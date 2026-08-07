@@ -680,11 +680,11 @@ function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map())
       continue;
     }
 
-    const glowPath = strokedPath(scaled, glowWidth);
-    const corePath = strokedPath(scaled, coreWidth);
+    const glowShapes = strokedShapes(scaled, glowWidth);
+    const coreShapes = strokedShapes(scaled, coreWidth);
     lines.push(
-      assDrawing(t0, t1, glowPath, color, "D5", 700),
-      assDrawing(t0, t1, corePath, color, "10", 700, 1),
+      ...glowShapes.map((shape) => assDrawing(t0, t1, shape, color, "D5", 700)),
+      ...coreShapes.map((shape) => assDrawing(t0, t1, shape, color, "10", 700, 1)),
     );
   }
 
@@ -723,8 +723,8 @@ function circlePath(cx, cy, radius) {
   return polygonPath(points);
 }
 
-/** Build filled segment quads plus round joins/caps as independent ASS subpaths. */
-function strokedPath(points, lineWidth) {
+/** Build separate filled quads and circles; libass may connect subpaths during fill. */
+function strokedShapes(points, lineWidth) {
   const radius = lineWidth / 2;
   const shapes = [circlePath(points[0].x, points[0].y, radius)];
   for (let i = 1; i < points.length; i += 1) {
@@ -745,7 +745,7 @@ function strokedPath(points, lineWidth) {
     }
     shapes.push(circlePath(b.x, b.y, radius));
   }
-  return shapes.join(" ");
+  return shapes;
 }
 
 function polygonPath(points) {
