@@ -12,17 +12,17 @@ COPY src ./src
 
 ENV PORT=10000
 ENV NODE_ENV=production
-# Cap Node heap so the process fails soft before the whole container is OOM-killed
-ENV NODE_OPTIONS=--max-old-space-size=192
-# Free-tier safe encode defaults (override in Render dashboard if you upgrade)
-ENV RENDER_WIDTH=854
-ENV RENDER_HEIGHT=480
-ENV RENDER_FPS=15
-ENV RENDER_MAX_SLIDES=20
-ENV RENDER_MAX_SEC=90
-ENV RENDER_LASERS=0
-ENV FFMPEG_PRESET=ultrafast
-ENV FFMPEG_CRF=30
+# Defaults tuned for Render Standard (~2GB). Override in dashboard for free tier.
+ENV NODE_OPTIONS=--max-old-space-size=768
+ENV RENDER_WIDTH=1280
+ENV RENDER_HEIGHT=720
+ENV RENDER_FPS=24
+ENV RENDER_MAX_SLIDES=40
+ENV RENDER_MAX_SEC=180
+ENV RENDER_LASERS=1
+ENV RENDER_MAX_LASERS=40
+ENV FFMPEG_PRESET=veryfast
+ENV FFMPEG_CRF=23
 EXPOSE 10000
 
 CMD ["node", "src/server.js"]

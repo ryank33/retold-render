@@ -1,12 +1,12 @@
 /**
  * Retold render worker (Render.com free tier = 512Mi).
  *
- * Memory strategy:
- * - Default 854×480 @ 15fps (not 720p/1080p)
+ * Memory strategy (works free + Standard):
  * - Pre-scale each photo to output size BEFORE concat (huge RAM win)
  * - One job at a time, single ffmpeg thread
  * - Cap slides / duration / lasers
- * - Skip lasers when RENDER_LASERS=0 (default off on free)
+ * - Defaults favor Standard (720p); override env on free tier if needed
+ * - RENDER_LASERS=0 disables laser burn-in
  */
 
 import { createWriteStream, promises as fs } from "node:fs";
@@ -22,17 +22,21 @@ const app = express();
 app.use(express.json({ limit: "4mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
-// Free tier safe defaults (override via env if you upgrade RAM)
-const OUT_W = Math.min(1280, Math.max(480, Number(process.env.RENDER_WIDTH || 854)));
-const OUT_H = Math.min(720, Math.max(270, Number(process.env.RENDER_HEIGHT || 480)));
-const OUT_FPS = Math.min(24, Math.max(10, Number(process.env.RENDER_FPS || 15)));
-const MAX_SLIDES = Math.min(40, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 20)));
-const MAX_TOTAL_SEC = Math.min(300, Math.max(20, Number(process.env.RENDER_MAX_SEC || 90)));
-const MAX_LASERS = Math.min(20, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 8)));
-const ENABLE_LASERS = process.env.RENDER_LASERS === "1" || process.env.RENDER_LASERS === "true";
-const FFMPEG_THREADS = 1;
-const PRESET = process.env.FFMPEG_PRESET || "ultrafast";
-const CRF = process.env.FFMPEG_CRF || "30";
+// Standard-plan defaults (override via env). Pre-scale still keeps RAM safe on free.
+const OUT_W = Math.min(1920, Math.max(480, Number(process.env.RENDER_WIDTH || 1280)));
+const OUT_H = Math.min(1080, Math.max(270, Number(process.env.RENDER_HEIGHT || 720)));
+const OUT_FPS = Math.min(30, Math.max(10, Number(process.env.RENDER_FPS || 24)));
+const MAX_SLIDES = Math.min(80, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 40)));
+const MAX_TOTAL_SEC = Math.min(600, Math.max(20, Number(process.env.RENDER_MAX_SEC || 180)));
+const MAX_LASERS = Math.min(80, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 40)));
+const ENABLE_LASERS =
+  process.env.RENDER_LASERS === undefined ||
+  process.env.RENDER_LASERS === "" ||
+  process.env.RENDER_LASERS === "1" ||
+  process.env.RENDER_LASERS === "true";
+const FFMPEG_THREADS = Math.max(1, Number(process.env.FFMPEG_THREADS || 2));
+const PRESET = process.env.FFMPEG_PRESET || "veryfast";
+const CRF = process.env.FFMPEG_CRF || "23";
 
 const jobs = new Map();
 let chain = Promise.resolve();
@@ -49,7 +53,9 @@ app.get("/health", (_req, res) => {
     maxSlides: MAX_SLIDES,
     maxSec: MAX_TOTAL_SEC,
     activeJobs,
-    planHint: "512Mi-safe",
+    planHint: process.env.RENDER_PLAN_HINT || "standard",
+    preset: PRESET,
+    crf: CRF,
   });
 });
 
@@ -226,11 +232,11 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     await runFfmpeg([
       "-y",
       "-threads",
-      "1",
+      String(FFMPEG_THREADS),
       "-filter_threads",
-      "1",
+      String(FFMPEG_THREADS),
       "-filter_complex_threads",
-      "1",
+      String(FFMPEG_THREADS),
       "-f",
       "concat",
       "-safe",
@@ -250,12 +256,6 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       "yuv420p",
       "-g",
       String(OUT_FPS * 2),
-      "-bf",
-      "0",
-      "-refs",
-      "1",
-      "-x264-params",
-      "threads=1:sliced-threads=0:sync-lookahead=0:rc-lookahead=0:scenecut=0",
       "-movflags",
       "+faststart",
       "-an",
@@ -281,7 +281,7 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       const args = [
         "-y",
         "-threads",
-        "1",
+        String(FFMPEG_THREADS),
         "-i",
         silentPath,
         "-i",
