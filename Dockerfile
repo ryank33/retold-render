@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim
 
 # ffmpeg for slideshow + voice mix (keep image small for free-tier RAM)
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

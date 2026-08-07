@@ -222,12 +222,17 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     }
     job.progress = 45;
 
-    const laserFilter =
-      ENABLE_LASERS && events?.length ? buildLaserFilter(events, totalSec) : "";
-
     const silentPath = join(workDir, "silent.mp4");
-    // Images already at OUT_WxOUT_H — keep vf tiny
-    const vf = ["format=yuv420p", `fps=${OUT_FPS}`, laserFilter].filter(Boolean).join(",");
+    // Images already at OUT_WxOUT_H. Lasers burned via ASS vector paths (not blocky drawbox).
+    const vfParts = ["format=yuv420p", `fps=${OUT_FPS}`];
+    if (ENABLE_LASERS && events?.length) {
+      const assPath = join(workDir, "lasers.ass");
+      await fs.writeFile(assPath, buildAssLasers(events, totalSec, OUT_W, OUT_H), "utf8");
+      // Escape path for ffmpeg filtergraph
+      const assEsc = assPath.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/,/g, "\\,");
+      vfParts.push(`ass=${assEsc}`);
+    }
+    const vf = vfParts.join(",");
 
     await runFfmpeg([
       "-y",
@@ -243,7 +248,8 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       "0",
       "-i",
       listPath,
-      ...(vf ? ["-vf", vf] : []),
+      "-vf",
+      vf,
       "-c:v",
       "libx264",
       "-preset",
@@ -384,36 +390,142 @@ function scaleImageLowMem(inputPath, outputPath) {
   ]);
 }
 
-function buildLaserFilter(events, totalSec) {
-  const parts = [];
-  const pointers = events.filter((e) => e.type === "pointer_stroke");
-  let count = 0;
+/**
+ * Burn lasers as real vector strokes/spots via ASS (libass), not solid rectangles.
+ * Coordinates in event payload are normalized 0–1.
+ */
+function buildAssLasers(events, totalSec, width, height) {
+  const pointers = events
+    .filter((e) => e.type === "pointer_stroke")
+    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+  const lines = [];
+  // Throttle spotlight spam (live room emits many move events)
+  let lastSpotMs = -9999;
+  let drawBudget = MAX_LASERS * 3;
+  let spotBudget = MAX_LASERS;
+
   for (const ev of pointers) {
-    if (count >= MAX_LASERS) break;
     const p = ev.payload || {};
     const t0 = Math.max(0, Number(ev.timestamp || 0) / 1000);
-    if (t0 > totalSec + 1) continue;
-    const color = sanitizeColor(p.color || "#f5c542");
-    const pts = Array.isArray(p.points) && p.points.length ? p.points : null;
-    const xN = Number(p.x ?? pts?.[0]?.x ?? 0.5);
-    const yN = Number(p.y ?? pts?.[0]?.y ?? 0.5);
-    const boxW = Math.round(OUT_W * 0.1);
-    const boxH = Math.round(OUT_H * 0.1);
-    const bx = Math.max(0, Math.min(OUT_W - boxW, Math.round(xN * OUT_W - boxW / 2)));
-    const by = Math.max(0, Math.min(OUT_H - boxH, Math.round(yN * OUT_H - boxH / 2)));
-    const t1 = Math.min(totalSec, t0 + 0.4);
-    parts.push(
-      `drawbox=x=${bx}:y=${by}:w=${boxW}:h=${boxH}:color=${color}@0.35:t=3:enable='between(t\\,${t0.toFixed(3)}\\,${t1.toFixed(3)})'`,
+    if (t0 > totalSec + 0.5) continue;
+    const mode = p.mode === "draw" ? "draw" : "spotlight";
+    const color = hexToAss(p.color || "#f5c542");
+    const pts = Array.isArray(p.points) ? p.points : [];
+
+    if (mode === "spotlight") {
+      if (spotBudget <= 0) continue;
+      const ms = Math.round(t0 * 1000);
+      if (ms - lastSpotMs < 70) continue; // ~14 spots/sec max
+      lastSpotMs = ms;
+      spotBudget -= 1;
+      const xN = Number(p.x ?? pts[0]?.x ?? 0.5);
+      const yN = Number(p.y ?? pts[0]?.y ?? 0.5);
+      if (!Number.isFinite(xN) || !Number.isFinite(yN)) continue;
+      const px = Math.round(clamp01(xN) * width);
+      const py = Math.round(clamp01(yN) * height);
+      const t1 = Math.min(totalSec + 0.2, t0 + 0.45);
+      // Soft ring + core (unicode circles) — looks like a laser spotlight, not a box
+      const fs = Math.round(Math.min(width, height) * 0.12);
+      lines.push(
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${fs}\\bord${Math.max(2, Math.round(fs * 0.08))}\\shad0\\1c${color}\\3c${color}\\1a&H88&\\3a&H40&}○`,
+      );
+      lines.push(
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${Math.round(fs * 0.22)}\\bord0\\shad0\\1c${color}\\1a&H50&}●`,
+      );
+      continue;
+    }
+
+    // Draw trail — sample path points into an ASS vector stroke
+    if (drawBudget <= 0) continue;
+    const rawPts =
+      pts.length >= 2
+        ? pts
+        : Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y))
+          ? [{ x: Number(p.x), y: Number(p.y) }]
+          : [];
+    if (!rawPts.length) continue;
+
+    // Downsample long trails
+    const step = Math.max(1, Math.floor(rawPts.length / 48));
+    const sampled = [];
+    for (let i = 0; i < rawPts.length; i += step) sampled.push(rawPts[i]);
+    if (sampled[sampled.length - 1] !== rawPts[rawPts.length - 1]) {
+      sampled.push(rawPts[rawPts.length - 1]);
+    }
+
+    const scaled = sampled
+      .map((pt) => {
+        const x = Math.round(clamp01(Number(pt.x)) * width);
+        const y = Math.round(clamp01(Number(pt.y)) * height);
+        return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+      })
+      .filter(Boolean);
+    if (!scaled.length) continue;
+
+    drawBudget -= 1;
+    const t1 = Math.min(totalSec + 0.3, t0 + 1.15);
+    const bord = Math.max(3, Math.round(Math.min(width, height) * 0.012));
+
+    if (scaled.length === 1) {
+      const { x, y } = scaled[0];
+      lines.push(
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${x},${y})\\fs${bord * 3}\\bord0\\1c${color}\\1a&H20&}●`,
+      );
+      continue;
+    }
+
+    // ASS drawing commands: m = move, l = line
+    const path = scaled
+      .map((pt, i) => (i === 0 ? `m ${pt.x} ${pt.y}` : `l ${pt.x} ${pt.y}`))
+      .join(" ");
+    lines.push(
+      `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an7\\pos(0,0)\\p1\\bord${bord}\\shad0\\1c${color}\\3c${color}\\1a&H30&\\3a&H10&}${path}{\\p0}`,
     );
-    count += 1;
   }
-  return parts.join(",");
+
+  return [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    `PlayResX: ${width}`,
+    `PlayResY: ${height}`,
+    "WrapStyle: 0",
+    "ScaledBorderAndShadow: yes",
+    "YCbCr Matrix: TV.709",
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    "Style: Laser,DejaVu Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ...lines,
+    "",
+  ].join("\n");
 }
 
-function sanitizeColor(hex) {
+function clamp01(n) {
+  if (!Number.isFinite(n)) return 0.5;
+  return Math.min(1, Math.max(0, n));
+}
+
+/** #RRGGBB → ASS &H00BBGGRR */
+function hexToAss(hex) {
   const m = String(hex).match(/^#?([0-9a-fA-F]{6})$/);
-  if (m) return `0x${m[1]}`;
-  return "0xf5c542";
+  if (!m) return "&H00F5C542";
+  const rr = m[1].slice(0, 2);
+  const gg = m[1].slice(2, 4);
+  const bb = m[1].slice(4, 6);
+  return `&H00${bb}${gg}${rr}`.toUpperCase();
+}
+
+function formatAssTime(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const whole = Math.floor(s % 60);
+  const cs = Math.min(99, Math.round((s - Math.floor(s)) * 100));
+  return `${h}:${String(m).padStart(2, "0")}:${String(whole).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
 }
 
 function normalizeSlides(slides) {
