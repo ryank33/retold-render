@@ -19,7 +19,7 @@
  * - Stream callback upload (don't buffer whole file in Node)
  */
 
-import { createReadStream, createWriteStream, promises as fs } from "node:fs";
+import { createWriteStream, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -285,10 +285,11 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     job.byteSize = stat.size;
 
     if (callbackUrl) {
-      // Stream file to Worker — avoid loading entire MP4 into Node heap
+      // Buffer upload (reliable on free tiers; files are small at 720p)
+      const fileBuf = await fs.readFile(outPath);
       const headers = {
         "Content-Type": "video/mp4",
-        "Content-Length": String(stat.size),
+        "Content-Length": String(fileBuf.byteLength),
         "X-Session-Id": job.sessionId,
         "X-Show-Id": job.showId || "",
         "X-Job-Id": job.id,
@@ -297,13 +298,10 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       };
       if (callbackSecret) headers.Authorization = `Bearer ${callbackSecret}`;
 
-      const fileStream = createReadStream(outPath);
       const up = await fetch(callbackUrl, {
         method: "POST",
         headers,
-        // Node 20+ supports duplex for streaming bodies
-        body: fileStream,
-        duplex: "half",
+        body: fileBuf,
       });
       if (!up.ok) {
         const t = await up.text().catch(() => "");
