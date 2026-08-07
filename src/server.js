@@ -250,11 +250,14 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
 
     // Download + pre-scale one image at a time (never feed multi-MP source into encoder)
     const localFiles = [];
+    const slideBoxes = new Map();
     for (let i = 0; i < timed.length; i += 1) {
       const s = timed[i];
       const rawPath = join(workDir, `raw-${String(i).padStart(3, "0")}.img`);
       const scaledPath = join(workDir, `slide-${String(i).padStart(3, "0")}.jpg`);
       await downloadToFile(s.url, rawPath);
+      const box = await probeContainedImageBox(rawPath, OUT_W, OUT_H);
+      slideBoxes.set(Number(s.position ?? s.photoPosition ?? i), box);
       await scaleImageLowMem(rawPath, scaledPath);
       await fs.unlink(rawPath).catch(() => undefined);
       localFiles.push({ path: scaledPath, durationSec: s.durationSec });
@@ -295,7 +298,11 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     const vfParts = ["format=yuv420p", `fps=${OUT_FPS}`];
     if (ENABLE_LASERS && events?.length) {
       const assPath = join(workDir, "lasers.ass");
-      await fs.writeFile(assPath, buildAssLasers(events, totalSec, OUT_W, OUT_H), "utf8");
+      await fs.writeFile(
+        assPath,
+        buildAssLasers(events, totalSec, OUT_W, OUT_H, slideBoxes),
+        "utf8",
+      );
       // Escape path for ffmpeg filtergraph
       const assEsc = assPath.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/,/g, "\\,");
       vfParts.push(`ass=${assEsc}`);
@@ -522,55 +529,121 @@ function scaleImageLowMem(inputPath, outputPath) {
   ]);
 }
 
+/** Return the exact content rectangle produced by scale+pad (contain). */
+async function probeContainedImageBox(inputPath, frameWidth, frameHeight) {
+  const dimensions = await probeImageDimensions(inputPath);
+  const scale = Math.min(frameWidth / dimensions.width, frameHeight / dimensions.height);
+  const width = dimensions.width * scale;
+  const height = dimensions.height * scale;
+  return {
+    offX: (frameWidth - width) / 2,
+    offY: (frameHeight - height) / 2,
+    width,
+    height,
+  };
+}
+
+function probeImageDimensions(inputPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(
+      "ffprobe",
+      [
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        inputPath,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (data) => { stdout += data.toString(); });
+    proc.stderr.on("data", (data) => { stderr += data.toString(); });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code !== 0) return reject(new Error(`ffprobe exit ${code}: ${stderr.slice(-500)}`));
+      try {
+        const stream = JSON.parse(stdout)?.streams?.[0];
+        const width = Number(stream?.width);
+        const height = Number(stream?.height);
+        if (!(width > 0 && height > 0)) throw new Error("missing image dimensions");
+        resolve({ width, height });
+      } catch (error) {
+        reject(new Error(`could not read image dimensions: ${error.message}`));
+      }
+    });
+  });
+}
+
 /**
  * Burn lasers via ASS (libass).
  *
- * Critical: ASS vector drawings FILL by default. For draw trails we use
- * fully transparent primary (\1a&HFF&) + thick outline (\bord + \3c) so the
- * path is a stroke only — not a filled polygon blob.
- * Coordinates in event payload are normalized 0–1.
+ * Coordinates are normalized against the displayed photo, not the padded
+ * output frame. Map them through the same contain rectangle as the browser.
+ * Filled segment polygons avoid libass's hollow/doubled polyline outlines.
  */
-function buildAssLasers(events, totalSec, width, height) {
+function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map()) {
   const pointers = events
     .filter((e) => e.type === "pointer_stroke")
     .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
   const lines = [];
-  let lastSpotMs = -9999;
   let drawBudget = MAX_LASERS * 4;
   let spotBudget = MAX_LASERS * 2;
-  const minDim = Math.min(width, height);
-  // Spotlight ~22% of frame (readable ring), draw stroke ~1.4% thickness
-  const spotFs = Math.round(minDim * 0.22);
-  const spotCore = Math.round(minDim * 0.045);
-  const strokeBord = Math.max(5, Math.round(minDim * 0.014));
+  const fullFrame = { offX: 0, offY: 0, width, height };
 
-  for (const ev of pointers) {
+  function boxFor(payload) {
+    return slideBoxes.get(Number(payload?.slide)) || fullFrame;
+  }
+
+  function pointInBox(point, box) {
+    const x = Number(point?.x);
+    const y = Number(point?.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    return {
+      x: Math.round(box.offX + clamp01(x) * box.width),
+      y: Math.round(box.offY + clamp01(y) * box.height),
+    };
+  }
+
+  for (let eventIndex = 0; eventIndex < pointers.length; eventIndex += 1) {
+    const ev = pointers[eventIndex];
     const p = ev.payload || {};
     const t0 = Math.max(0, Number(ev.timestamp || 0) / 1000);
     if (t0 > totalSec + 0.5) continue;
     const mode = p.mode === "draw" ? "draw" : "spotlight";
     const color = hexToAss(p.color || "#f5c542");
     const pts = Array.isArray(p.points) ? p.points : [];
+    const box = boxFor(p);
 
     if (mode === "spotlight") {
       if (spotBudget <= 0) continue;
-      const ms = Math.round(t0 * 1000);
-      if (ms - lastSpotMs < 80) continue;
-      lastSpotMs = ms;
       spotBudget -= 1;
-      const xN = Number(p.x ?? pts[0]?.x ?? 0.5);
-      const yN = Number(p.y ?? pts[0]?.y ?? 0.5);
-      if (!Number.isFinite(xN) || !Number.isFinite(yN)) continue;
-      const px = Math.round(clamp01(xN) * width);
-      const py = Math.round(clamp01(yN) * height);
-      const t1 = Math.min(totalSec + 0.2, t0 + 0.55);
-      // Large outer ring (outline-heavy) + brighter core
+      const point = pointInBox(pts[pts.length - 1] || { x: p.x, y: p.y }, box);
+      if (!point) continue;
+      const actor = ev.actor_id ?? ev.actor ?? "unknown";
+      const nextForActor = pointers.slice(eventIndex + 1).find((candidate) => {
+        const candidatePayload = candidate.payload || {};
+        return (candidate.actor_id ?? candidate.actor ?? "unknown") === actor &&
+          Number(candidatePayload.slide) === Number(p.slide);
+      });
+      const replacedAt = nextForActor ? Number(nextForActor.timestamp || 0) / 1000 : Infinity;
+      const t1 = Math.min(totalSec + 0.2, t0 + 0.7, replacedAt);
+      if (t1 <= t0) continue;
+      const radius = Math.max(38, Math.min(box.width, box.height) * 0.11);
+      const glowPath = circlePath(point.x, point.y, radius);
+      const midPath = circlePath(point.x, point.y, radius * 0.58);
+      const coreSize = Math.max(12, Math.round(radius * 0.38));
+      const fadeMs = Math.max(1, Math.round((t1 - t0) * 1000));
+      // Three layers approximate the browser's radial glow without leaving
+      // a trail of overlapping rings as pointermove events arrive.
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${spotFs}\\bord${Math.max(4, Math.round(spotFs * 0.07))}\\shad0\\1c${color}\\3c${color}\\1a&HC0&\\3a&H20&}○`,
+        assDrawing(t0, t1, glowPath, color, "C8", fadeMs),
+        assDrawing(t0, t1, midPath, color, "D8", fadeMs),
       );
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${spotCore}\\bord0\\shad0\\1c${color}\\1a&H40&}●`,
+        `Dialogue: 1,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${point.x},${point.y})\\fs${coreSize}\\bord2\\shad0\\1c${color}\\3c${color}\\1a&H50&\\3a&H20&\\fad(0,${fadeMs})}○`,
       );
       continue;
     }
@@ -591,33 +664,27 @@ function buildAssLasers(events, totalSec, width, height) {
     const last = rawPts[rawPts.length - 1];
     if (sampled[sampled.length - 1] !== last) sampled.push(last);
 
-    const scaled = sampled
-      .map((pt) => {
-        const x = Math.round(clamp01(Number(pt.x)) * width);
-        const y = Math.round(clamp01(Number(pt.y)) * height);
-        return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
-      })
-      .filter(Boolean);
+    const scaled = sampled.map((pt) => pointInBox(pt, box)).filter(Boolean);
     if (!scaled.length) continue;
 
     drawBudget -= 1;
-    const t1 = Math.min(totalSec + 0.3, t0 + 1.25);
+    const t1 = Math.min(totalSec + 0.3, t0 + 3.5);
+    const coreWidth = Math.max(4, Math.round(Math.min(width, height) * 0.007));
+    const glowWidth = coreWidth * 3;
 
     if (scaled.length === 1) {
       const { x, y } = scaled[0];
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${x},${y})\\fs${strokeBord * 2}\\bord0\\1c${color}\\1a&H30&}●`,
+        `Dialogue: 1,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${x},${y})\\fs${coreWidth * 2}\\bord0\\1c${color}\\1a&H10&\\fad(0,600)}●`,
       );
       continue;
     }
 
-    // Open path as STROKE: transparent fill (\1a&HFF&), thick outline (\bord + \3c)
-    // Drawing as one polyline with no fill avoids the big solid blobs in the video.
-    const path = scaled
-      .map((pt, i) => (i === 0 ? `m ${pt.x} ${pt.y}` : `l ${pt.x} ${pt.y}`))
-      .join(" ");
+    const glowPath = strokedPath(scaled, glowWidth);
+    const corePath = strokedPath(scaled, coreWidth);
     lines.push(
-      `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an7\\pos(0,0)\\p1\\bord${strokeBord}\\shad0\\1a&HFF&\\3a&H00&\\3c${color}&}${path}{\\p0}`,
+      assDrawing(t0, t1, glowPath, color, "D5", 700),
+      assDrawing(t0, t1, corePath, color, "10", 700, 1),
     );
   }
 
@@ -640,6 +707,53 @@ function buildAssLasers(events, totalSec, width, height) {
     ...lines,
     "",
   ].join("\n");
+}
+
+function assDrawing(t0, t1, path, color, alpha = "00", fadeMs = 0, layer = 0) {
+  const fade = fadeMs ? `\\fad(0,${fadeMs})` : "";
+  return `Dialogue: ${layer},${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c${color}\\1a&H${alpha}&${fade}}${path}{\\p0}`;
+}
+
+function circlePath(cx, cy, radius) {
+  const points = [];
+  for (let i = 0; i < 16; i += 1) {
+    const angle = (Math.PI * 2 * i) / 16;
+    points.push({ x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius });
+  }
+  return polygonPath(points);
+}
+
+/** Build filled segment quads plus round joins/caps as independent ASS subpaths. */
+function strokedPath(points, lineWidth) {
+  const radius = lineWidth / 2;
+  const shapes = [circlePath(points[0].x, points[0].y, radius)];
+  for (let i = 1; i < points.length; i += 1) {
+    const a = points[i - 1];
+    const b = points[i];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const length = Math.hypot(dx, dy);
+    if (length > 0.01) {
+      const nx = (-dy / length) * radius;
+      const ny = (dx / length) * radius;
+      shapes.push(polygonPath([
+        { x: a.x + nx, y: a.y + ny },
+        { x: b.x + nx, y: b.y + ny },
+        { x: b.x - nx, y: b.y - ny },
+        { x: a.x - nx, y: a.y - ny },
+      ]));
+    }
+    shapes.push(circlePath(b.x, b.y, radius));
+  }
+  return shapes.join(" ");
+}
+
+function polygonPath(points) {
+  if (!points.length) return "";
+  const path = points
+    .map((point, index) => `${index === 0 ? "m" : "l"} ${Math.round(point.x)} ${Math.round(point.y)}`)
+    .join(" ");
+  return `${path} l ${Math.round(points[0].x)} ${Math.round(points[0].y)}`;
 }
 
 function clamp01(n) {
@@ -683,7 +797,7 @@ function normalizeSlides(slides) {
       }
     }
     durationSec = Math.min(MAX_TOTAL_SEC, Math.max(0.1, durationSec));
-    return { url: s.url, durationSec, caption: s.caption || "" };
+    return { ...s, url: s.url, durationSec, caption: s.caption || "" };
   });
 }
 
@@ -757,3 +871,5 @@ app.listen(PORT, () => {
     `[retold-render] :${PORT} out=${OUT_W}x${OUT_H}@${OUT_FPS} lasers=${ENABLE_LASERS} maxSlides=${MAX_SLIDES}`,
   );
 });
+
+export { buildAssLasers, probeContainedImageBox };
