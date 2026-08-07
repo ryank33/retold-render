@@ -365,8 +365,8 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         return `[${index + 1}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=mono,adelay=${delay}|${delay},volume=1.0[a${index}]`;
       });
       const mix = audioFiles.length === 1
-        ? `${delayed[0]};[a0]anull[aout]`
-        : `${delayed.join(";")};${audioFiles.map((_, i) => `[a${i}]`).join("")}amix=inputs=${audioFiles.length}:normalize=0:duration=longest:dropout_transition=0[aout]`;
+        ? `${delayed[0]};[a0]apad[aout]`
+        : `${delayed.join(";")};${audioFiles.map((_, i) => `[a${i}]`).join("")}amix=inputs=${audioFiles.length}:normalize=0:duration=longest:dropout_transition=0[mixed];[mixed]apad[aout]`;
       args.push(
         "-filter_complex",
         mix,
@@ -382,7 +382,8 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         "96k",
         "-ac",
         "1",
-        "-shortest",
+        "-t",
+        String(Math.max(1, totalSec)),
         "-movflags",
         "+faststart",
         outPath,
