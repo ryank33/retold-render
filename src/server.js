@@ -391,7 +391,11 @@ function scaleImageLowMem(inputPath, outputPath) {
 }
 
 /**
- * Burn lasers as real vector strokes/spots via ASS (libass), not solid rectangles.
+ * Burn lasers via ASS (libass).
+ *
+ * Critical: ASS vector drawings FILL by default. For draw trails we use
+ * fully transparent primary (\1a&HFF&) + thick outline (\bord + \3c) so the
+ * path is a stroke only — not a filled polygon blob.
  * Coordinates in event payload are normalized 0–1.
  */
 function buildAssLasers(events, totalSec, width, height) {
@@ -400,10 +404,14 @@ function buildAssLasers(events, totalSec, width, height) {
     .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
   const lines = [];
-  // Throttle spotlight spam (live room emits many move events)
   let lastSpotMs = -9999;
-  let drawBudget = MAX_LASERS * 3;
-  let spotBudget = MAX_LASERS;
+  let drawBudget = MAX_LASERS * 4;
+  let spotBudget = MAX_LASERS * 2;
+  const minDim = Math.min(width, height);
+  // Spotlight ~22% of frame (readable ring), draw stroke ~1.4% thickness
+  const spotFs = Math.round(minDim * 0.22);
+  const spotCore = Math.round(minDim * 0.045);
+  const strokeBord = Math.max(5, Math.round(minDim * 0.014));
 
   for (const ev of pointers) {
     const p = ev.payload || {};
@@ -416,7 +424,7 @@ function buildAssLasers(events, totalSec, width, height) {
     if (mode === "spotlight") {
       if (spotBudget <= 0) continue;
       const ms = Math.round(t0 * 1000);
-      if (ms - lastSpotMs < 70) continue; // ~14 spots/sec max
+      if (ms - lastSpotMs < 80) continue;
       lastSpotMs = ms;
       spotBudget -= 1;
       const xN = Number(p.x ?? pts[0]?.x ?? 0.5);
@@ -424,19 +432,18 @@ function buildAssLasers(events, totalSec, width, height) {
       if (!Number.isFinite(xN) || !Number.isFinite(yN)) continue;
       const px = Math.round(clamp01(xN) * width);
       const py = Math.round(clamp01(yN) * height);
-      const t1 = Math.min(totalSec + 0.2, t0 + 0.45);
-      // Soft ring + core (unicode circles) — looks like a laser spotlight, not a box
-      const fs = Math.round(Math.min(width, height) * 0.12);
+      const t1 = Math.min(totalSec + 0.2, t0 + 0.55);
+      // Large outer ring (outline-heavy) + brighter core
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${fs}\\bord${Math.max(2, Math.round(fs * 0.08))}\\shad0\\1c${color}\\3c${color}\\1a&H88&\\3a&H40&}○`,
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${spotFs}\\bord${Math.max(4, Math.round(spotFs * 0.07))}\\shad0\\1c${color}\\3c${color}\\1a&HC0&\\3a&H20&}○`,
       );
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${Math.round(fs * 0.22)}\\bord0\\shad0\\1c${color}\\1a&H50&}●`,
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${px},${py})\\fs${spotCore}\\bord0\\shad0\\1c${color}\\1a&H40&}●`,
       );
       continue;
     }
 
-    // Draw trail — sample path points into an ASS vector stroke
+    // Draw trail — stroke only (never fill the polygon)
     if (drawBudget <= 0) continue;
     const rawPts =
       pts.length >= 2
@@ -446,13 +453,11 @@ function buildAssLasers(events, totalSec, width, height) {
           : [];
     if (!rawPts.length) continue;
 
-    // Downsample long trails
-    const step = Math.max(1, Math.floor(rawPts.length / 48));
+    const step = Math.max(1, Math.floor(rawPts.length / 64));
     const sampled = [];
     for (let i = 0; i < rawPts.length; i += step) sampled.push(rawPts[i]);
-    if (sampled[sampled.length - 1] !== rawPts[rawPts.length - 1]) {
-      sampled.push(rawPts[rawPts.length - 1]);
-    }
+    const last = rawPts[rawPts.length - 1];
+    if (sampled[sampled.length - 1] !== last) sampled.push(last);
 
     const scaled = sampled
       .map((pt) => {
@@ -464,23 +469,23 @@ function buildAssLasers(events, totalSec, width, height) {
     if (!scaled.length) continue;
 
     drawBudget -= 1;
-    const t1 = Math.min(totalSec + 0.3, t0 + 1.15);
-    const bord = Math.max(3, Math.round(Math.min(width, height) * 0.012));
+    const t1 = Math.min(totalSec + 0.3, t0 + 1.25);
 
     if (scaled.length === 1) {
       const { x, y } = scaled[0];
       lines.push(
-        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${x},${y})\\fs${bord * 3}\\bord0\\1c${color}\\1a&H20&}●`,
+        `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${x},${y})\\fs${strokeBord * 2}\\bord0\\1c${color}\\1a&H30&}●`,
       );
       continue;
     }
 
-    // ASS drawing commands: m = move, l = line
+    // Open path as STROKE: transparent fill (\1a&HFF&), thick outline (\bord + \3c)
+    // Drawing as one polyline with no fill avoids the big solid blobs in the video.
     const path = scaled
       .map((pt, i) => (i === 0 ? `m ${pt.x} ${pt.y}` : `l ${pt.x} ${pt.y}`))
       .join(" ");
     lines.push(
-      `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an7\\pos(0,0)\\p1\\bord${bord}\\shad0\\1c${color}\\3c${color}\\1a&H30&\\3a&H10&}${path}{\\p0}`,
+      `Dialogue: 0,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an7\\pos(0,0)\\p1\\bord${strokeBord}\\shad0\\1a&HFF&\\3a&H00&\\3c${color}&}${path}{\\p0}`,
     );
   }
 
@@ -495,6 +500,7 @@ function buildAssLasers(events, totalSec, width, height) {
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    // BorderStyle=1 = outline+shadow (needed for stroke-only drawings)
     "Style: Laser,DejaVu Sans,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
     "",
     "[Events]",
