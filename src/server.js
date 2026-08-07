@@ -37,6 +37,7 @@ const ENABLE_LASERS =
 const FFMPEG_THREADS = Math.max(1, Number(process.env.FFMPEG_THREADS || 2));
 const PRESET = process.env.FFMPEG_PRESET || "veryfast";
 const CRF = process.env.FFMPEG_CRF || "23";
+const RENDER_HOOK_KEY = process.env.RENDER_HOOK_KEY || "";
 
 const jobs = new Map();
 let chain = Promise.resolve();
@@ -72,8 +73,100 @@ app.get("/jobs/:id", (req, res) => {
   });
 });
 
+function bearer(req) {
+  return String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+}
+
+function adaptManifestJob(body) {
+  const manifest = body.manifest || {};
+  const rawEvents = Array.isArray(manifest.events) ? manifest.events : [];
+  const durationMs = Math.max(1000, Number(manifest.duration_ms) || 1000);
+  const slides = timedSlidesFromManifest(
+    Array.isArray(manifest.slides) ? manifest.slides : [],
+    rawEvents,
+    durationMs,
+  );
+  const audioTracks = (Array.isArray(manifest.audio_tracks) ? manifest.audio_tracks : []).map((track) => ({
+    name: track.name || track.email || track.user_id || "speaker",
+    offsetMs: Number(track.start_offset) || 0,
+    chunks: (Array.isArray(track.chunks) ? track.chunks : []).map((chunk) => ({
+      url: chunk.url,
+      offsetMs: Number(chunk.offset_ms) || 0,
+      sequence: Number(chunk.sequence) || 0,
+      contentType: chunk.content_type || track.mime || "audio/webm",
+    })),
+  }));
+
+  return {
+    jobId: body.job_id,
+    sessionId: body.session_id || manifest.session_id,
+    showId: manifest.show?.id,
+    title: manifest.show?.title || "Retold show",
+    slides,
+    audioTracks,
+    events: normalizeManifestEvents(rawEvents),
+    callbackUrl: manifest.callback_url,
+    statusCallbackUrl: manifest.status_callback_url,
+    callbackSecret: RENDER_HOOK_KEY,
+  };
+}
+
+function timedSlidesFromManifest(photos, events, durationMs) {
+  if (!photos.length) return [];
+  const byPosition = new Map(photos.map((photo, index) => [Number(photo.position ?? index), photo]));
+  const changes = events
+    .filter((event) => event.type === "slide.change")
+    .map((event) => ({ t: Math.max(0, Number(event.t_ms) || 0), index: Number(event.payload?.index) || 0 }))
+    .sort((a, b) => a.t - b.t);
+
+  const segments = [];
+  let current = 0;
+  let start = 0;
+  for (const change of changes) {
+    const at = Math.min(durationMs, change.t);
+    if (at > start) {
+      const photo = byPosition.get(current) || photos[current] || photos[0];
+      segments.push({ ...photo, index: segments.length, startMs: start, endMs: at, durationSec: (at - start) / 1000 });
+    }
+    current = change.index;
+    start = at;
+  }
+  if (start < durationMs || !segments.length) {
+    const photo = byPosition.get(current) || photos[current] || photos[0];
+    segments.push({
+      ...photo,
+      index: segments.length,
+      startMs: start,
+      endMs: durationMs,
+      durationSec: Math.max(0.1, (durationMs - start) / 1000),
+    });
+  }
+  return segments;
+}
+
+function normalizeManifestEvents(events) {
+  return events.map((event) => {
+    if (event.type !== "pointer") return event;
+    return {
+      ...event,
+      type: "pointer_stroke",
+      timestamp: Number(event.t_ms) || 0,
+      payload: {
+        ...(event.payload || {}),
+        mode: event.payload?.mode === "stroke" ? "draw" : "spotlight",
+      },
+    };
+  });
+}
+
 app.post("/render", async (req, res) => {
-  const body = req.body || {};
+  const rawBody = req.body || {};
+  const isManifestJob = !!rawBody.manifest;
+  if (isManifestJob && (!RENDER_HOOK_KEY || bearer(req) !== RENDER_HOOK_KEY)) {
+    return res.status(403).json({ error: "bad render hook key" });
+  }
+
+  const body = isManifestJob ? adaptManifestJob(rawBody) : rawBody;
   const {
     sessionId,
     showId,
@@ -83,6 +176,7 @@ app.post("/render", async (req, res) => {
     events = [],
     callbackUrl,
     callbackSecret,
+    statusCallbackUrl,
   } = body;
 
   if (!sessionId || !Array.isArray(slides) || slides.length === 0) {
@@ -93,7 +187,11 @@ app.post("/render", async (req, res) => {
     // Still accept but queue — don't run parallel ffmpeg
   }
 
-  const id = randomUUID();
+  const id = body.jobId || randomUUID();
+  const existing = jobs.get(id);
+  if (existing && (existing.status === "queued" || existing.status === "rendering" || existing.status === "ready")) {
+    return res.status(202).json({ jobId: id, status: existing.status, duplicate: true });
+  }
   const job = {
     id,
     sessionId,
@@ -119,10 +217,13 @@ app.post("/render", async (req, res) => {
 
   chain = chain
     .then(() => runJob(job, { slides, audioTracks, events, callbackUrl, callbackSecret }))
-    .catch((err) => {
+    .catch(async (err) => {
       job.status = "failed";
       job.error = err instanceof Error ? err.message : String(err);
       console.error("[render] job failed", id, job.error);
+      await notifyFailure(statusCallbackUrl, callbackSecret, job.error).catch((callbackErr) => {
+        console.error("[render] failure callback failed", callbackErr?.message);
+      });
     });
 });
 
@@ -174,50 +275,17 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       .concat(`\nfile '${localFiles[localFiles.length - 1].path.replace(/'/g, "'\\''")}'\n`);
     await fs.writeFile(listPath, listBody, "utf8");
 
-    // One audio track max on free tier
+    // Build up to six independently timed participant tracks. Chunked captures
+    // are mixed onto the master clock before the final video mix.
     const audioFiles = [];
-    const tracks = (audioTracks || []).slice(0, 1);
+    const tracks = (audioTracks || []).slice(0, 6);
     for (let i = 0; i < tracks.length; i += 1) {
       const t = tracks[i];
-      if (!t?.url) continue;
       try {
-        const dest = join(workDir, `audio-${i}.webm`);
-        await downloadToFile(t.url, dest);
-        // Re-encode audio to low-rate AAC intermediate to shrink decode RAM later
-        const aacPath = join(workDir, `audio-${i}.m4a`);
-        try {
-          await runFfmpeg([
-            "-y",
-            "-threads",
-            "1",
-            "-i",
-            dest,
-            "-vn",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-ac",
-            "1",
-            "-ar",
-            "44100",
-            aacPath,
-          ]);
-          await fs.unlink(dest).catch(() => undefined);
-          audioFiles.push({
-            path: aacPath,
-            offsetMs: Number(t.offsetMs) || 0,
-            name: t.name || `track${i}`,
-          });
-        } catch {
-          audioFiles.push({
-            path: dest,
-            offsetMs: Number(t.offsetMs) || 0,
-            name: t.name || `track${i}`,
-          });
-        }
+        const prepared = await prepareAudioTrack(workDir, t, i);
+        if (prepared) audioFiles.push(prepared);
       } catch (err) {
-        console.warn("[render] audio download skip", t.url, err?.message);
+        console.warn("[render] audio track skip", t?.name || i, err?.message);
       }
     }
     job.progress = 45;
@@ -290,10 +358,18 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         String(FFMPEG_THREADS),
         "-i",
         silentPath,
-        "-i",
-        audioFiles[0].path,
+      ];
+      for (const audio of audioFiles) args.push("-i", audio.path);
+      const delayed = audioFiles.map((audio, index) => {
+        const delay = Math.max(0, Number(audio.offsetMs) || 0);
+        return `[${index + 1}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=mono,adelay=${delay}|${delay},volume=1.0[a${index}]`;
+      });
+      const mix = audioFiles.length === 1
+        ? `${delayed[0]};[a0]anull[aout]`
+        : `${delayed.join(";")};${audioFiles.map((_, i) => `[a${i}]`).join("")}amix=inputs=${audioFiles.length}:normalize=0:duration=longest:dropout_transition=0[aout]`;
+      args.push(
         "-filter_complex",
-        `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=mono,adelay=${Math.max(0, audioFiles[0].offsetMs)}|${Math.max(0, audioFiles[0].offsetMs)},volume=1.0[aout]`,
+        mix,
         "-map",
         "0:v:0",
         "-map",
@@ -310,7 +386,7 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         "-movflags",
         "+faststart",
         outPath,
-      ];
+      );
       try {
         await runFfmpeg(args);
         await fs.unlink(silentPath).catch(() => undefined);
@@ -369,6 +445,61 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
   } finally {
     activeJobs = Math.max(0, activeJobs - 1);
     fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function prepareAudioTrack(workDir, track, index) {
+  const chunks = (Array.isArray(track?.chunks) ? track.chunks : [])
+    .filter((chunk) => chunk?.url)
+    .sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
+  const outputPath = join(workDir, `audio-${index}.m4a`);
+
+  if (chunks.length) {
+    const localChunks = [];
+    for (let i = 0; i < chunks.length; i += 1) {
+      const path = join(workDir, `audio-${index}-chunk-${String(i).padStart(3, "0")}.bin`);
+      await downloadToFile(chunks[i].url, path);
+      localChunks.push({ path, offsetMs: Math.max(0, Number(chunks[i].offsetMs) || 0) });
+    }
+
+    try {
+      const args = ["-y", "-threads", "1"];
+      for (const chunk of localChunks) args.push("-i", chunk.path);
+      const delayed = localChunks.map((chunk, i) =>
+        `[${i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=mono,adelay=${chunk.offsetMs}|${chunk.offsetMs}[c${i}]`,
+      );
+      const mix = localChunks.length === 1
+        ? `${delayed[0]};[c0]anull[trackout]`
+        : `${delayed.join(";")};${localChunks.map((_, i) => `[c${i}]`).join("")}amix=inputs=${localChunks.length}:normalize=0:duration=longest:dropout_transition=0[trackout]`;
+      args.push(
+        "-filter_complex", mix,
+        "-map", "[trackout]",
+        "-vn",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-ac", "1",
+        "-ar", "44100",
+        outputPath,
+      );
+      await runFfmpeg(args);
+    } finally {
+      for (const chunk of localChunks) await fs.unlink(chunk.path).catch(() => undefined);
+    }
+    return { path: outputPath, offsetMs: 0, name: track.name || `track${index}` };
+  }
+
+  if (!track?.url) return null;
+  const rawPath = join(workDir, `audio-${index}.raw`);
+  await downloadToFile(track.url, rawPath);
+  try {
+    await runFfmpeg([
+      "-y", "-threads", "1", "-i", rawPath, "-vn",
+      "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "44100", outputPath,
+    ]);
+    await fs.unlink(rawPath).catch(() => undefined);
+    return { path: outputPath, offsetMs: Number(track.offsetMs) || 0, name: track.name || `track${index}` };
+  } catch {
+    return { path: rawPath, offsetMs: Number(track.offsetMs) || 0, name: track.name || `track${index}` };
   }
 }
 
@@ -550,7 +681,7 @@ function normalizeSlides(slides) {
         durationSec = 3.5;
       }
     }
-    durationSec = Math.min(20, Math.max(1.2, durationSec));
+    durationSec = Math.min(MAX_TOTAL_SEC, Math.max(0.1, durationSec));
     return { url: s.url, durationSec, caption: s.caption || "" };
   });
 }
@@ -575,6 +706,18 @@ async function downloadToFile(url, dest) {
   const body = res.body;
   if (!body) throw new Error("empty body");
   await pipeline(Readable.fromWeb(body), createWriteStream(dest));
+}
+
+async function notifyFailure(callbackUrl, callbackSecret, error) {
+  if (!callbackUrl) return;
+  const headers = { "content-type": "application/json" };
+  if (callbackSecret) headers.Authorization = `Bearer ${callbackSecret}`;
+  const response = await fetch(callbackUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ status: "failed", error: String(error || "render failed").slice(0, 1000) }),
+  });
+  if (!response.ok) throw new Error(`status callback ${response.status}`);
 }
 
 function runFfmpeg(args) {
