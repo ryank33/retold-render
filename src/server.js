@@ -1,22 +1,12 @@
 /**
- * Retold render worker (Render.com).
+ * Retold render worker (Render.com free tier = 512Mi).
  *
- * POST /render
- *   {
- *     sessionId, showId, title,
- *     slides: [{ index, url, startMs, endMs, durationSec }],
- *     audioTracks: [{ participantId, name, url, offsetMs }],
- *     events: [{ timestamp, type, payload }],  // for laser burn-in
- *     callbackUrl, callbackSecret
- *   }
- *
- * Slideshow + mixed audio + laser overlays → MP4 → Worker → R2.
- *
- * Memory notes (exit 137 = SIGKILL / OOM on free/starter instances):
- * - Default output is 720p @ 24fps (not 1080p30)
- * - Only one ffmpeg job at a time
- * - Cap duration / slide count / laser overlays
- * - Stream callback upload (don't buffer whole file in Node)
+ * Memory strategy:
+ * - Default 854×480 @ 15fps (not 720p/1080p)
+ * - Pre-scale each photo to output size BEFORE concat (huge RAM win)
+ * - One job at a time, single ffmpeg thread
+ * - Cap slides / duration / lasers
+ * - Skip lasers when RENDER_LASERS=0 (default off on free)
  */
 
 import { createWriteStream, promises as fs } from "node:fs";
@@ -29,20 +19,22 @@ import { Readable } from "node:stream";
 import express from "express";
 
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
-/** Output width (720 default — free Render plans often OOM at 1080p). */
-const OUT_W = Math.min(1920, Math.max(640, Number(process.env.RENDER_WIDTH || 1280)));
-const OUT_H = Math.min(1080, Math.max(360, Number(process.env.RENDER_HEIGHT || 720)));
-const OUT_FPS = Math.min(30, Math.max(12, Number(process.env.RENDER_FPS || 24)));
-const MAX_SLIDES = Math.min(80, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 40)));
-const MAX_TOTAL_SEC = Math.min(600, Math.max(30, Number(process.env.RENDER_MAX_SEC || 180)));
-const MAX_LASERS = Math.min(40, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 24)));
-const FFMPEG_THREADS = Math.max(1, Number(process.env.FFMPEG_THREADS || 1));
+// Free tier safe defaults (override via env if you upgrade RAM)
+const OUT_W = Math.min(1280, Math.max(480, Number(process.env.RENDER_WIDTH || 854)));
+const OUT_H = Math.min(720, Math.max(270, Number(process.env.RENDER_HEIGHT || 480)));
+const OUT_FPS = Math.min(24, Math.max(10, Number(process.env.RENDER_FPS || 15)));
+const MAX_SLIDES = Math.min(40, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 20)));
+const MAX_TOTAL_SEC = Math.min(300, Math.max(20, Number(process.env.RENDER_MAX_SEC || 90)));
+const MAX_LASERS = Math.min(20, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 8)));
+const ENABLE_LASERS = process.env.RENDER_LASERS === "1" || process.env.RENDER_LASERS === "true";
+const FFMPEG_THREADS = 1;
+const PRESET = process.env.FFMPEG_PRESET || "ultrafast";
+const CRF = process.env.FFMPEG_CRF || "30";
 
 const jobs = new Map();
-/** Serialize renders — parallel ffmpeg jobs blow RAM on small instances. */
 let chain = Promise.resolve();
 let activeJobs = 0;
 
@@ -52,10 +44,12 @@ app.get("/health", (_req, res) => {
     service: "retold-render",
     ffmpeg: true,
     audio: true,
-    lasers: true,
+    lasers: ENABLE_LASERS,
     out: `${OUT_W}x${OUT_H}@${OUT_FPS}`,
+    maxSlides: MAX_SLIDES,
+    maxSec: MAX_TOTAL_SEC,
     activeJobs,
-    queueDepth: jobs.size,
+    planHint: "512Mi-safe",
   });
 });
 
@@ -89,6 +83,10 @@ app.post("/render", async (req, res) => {
     return res.status(400).json({ error: "sessionId and slides[] required" });
   }
 
+  if (activeJobs > 0) {
+    // Still accept but queue — don't run parallel ffmpeg
+  }
+
   const id = randomUUID();
   const job = {
     id,
@@ -102,12 +100,12 @@ app.post("/render", async (req, res) => {
     byteSize: null,
   };
   jobs.set(id, job);
-  // Bound in-memory job map
-  if (jobs.size > 40) {
-    const oldest = [...jobs.keys()].slice(0, jobs.size - 40);
-    for (const k of oldest) {
-      const j = jobs.get(k);
-      if (j && (j.status === "ready" || j.status === "failed")) jobs.delete(k);
+  if (jobs.size > 30) {
+    for (const [k, j] of jobs) {
+      if (j.status === "ready" || j.status === "failed") {
+        jobs.delete(k);
+        if (jobs.size <= 20) break;
+      }
     }
   }
 
@@ -131,7 +129,6 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
 
   try {
     let timed = normalizeSlides(slides).slice(0, MAX_SLIDES);
-    // Soft-cap total runtime so free tiers don't OOM on long sessions
     let totalSec = timed.reduce((a, s) => a + s.durationSec, 0);
     if (totalSec > MAX_TOTAL_SEC) {
       const scale = MAX_TOTAL_SEC / totalSec;
@@ -142,16 +139,21 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       totalSec = timed.reduce((a, s) => a + s.durationSec, 0);
       console.warn("[render] capped duration to", totalSec.toFixed(1), "s");
     }
-    job.progress = 10;
+    job.progress = 8;
 
+    // Download + pre-scale one image at a time (never feed multi-MP source into encoder)
     const localFiles = [];
     for (let i = 0; i < timed.length; i += 1) {
       const s = timed[i];
-      const ext = guessExt(s.url);
-      const dest = join(workDir, `slide-${String(i).padStart(3, "0")}.${ext}`);
-      await downloadToFile(s.url, dest);
-      localFiles.push({ path: dest, durationSec: s.durationSec });
-      job.progress = 10 + Math.floor((i / timed.length) * 25);
+      const rawPath = join(workDir, `raw-${String(i).padStart(3, "0")}.img`);
+      const scaledPath = join(workDir, `slide-${String(i).padStart(3, "0")}.jpg`);
+      await downloadToFile(s.url, rawPath);
+      await scaleImageLowMem(rawPath, scaledPath);
+      await fs.unlink(rawPath).catch(() => undefined);
+      localFiles.push({ path: scaledPath, durationSec: s.durationSec });
+      job.progress = 8 + Math.floor((i / timed.length) * 30);
+      // Yield event loop between slides
+      await new Promise((r) => setImmediate(r));
     }
 
     if (!localFiles.length) throw new Error("no slides downloaded");
@@ -166,60 +168,94 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       .concat(`\nfile '${localFiles[localFiles.length - 1].path.replace(/'/g, "'\\''")}'\n`);
     await fs.writeFile(listPath, listBody, "utf8");
 
-    // Download audio tracks (cap 2 tracks for RAM)
+    // One audio track max on free tier
     const audioFiles = [];
-    const tracks = (audioTracks || []).slice(0, 2);
+    const tracks = (audioTracks || []).slice(0, 1);
     for (let i = 0; i < tracks.length; i += 1) {
       const t = tracks[i];
       if (!t?.url) continue;
       try {
         const dest = join(workDir, `audio-${i}.webm`);
         await downloadToFile(t.url, dest);
-        audioFiles.push({
-          path: dest,
-          offsetMs: Number(t.offsetMs) || 0,
-          name: t.name || `track${i}`,
-        });
+        // Re-encode audio to low-rate AAC intermediate to shrink decode RAM later
+        const aacPath = join(workDir, `audio-${i}.m4a`);
+        try {
+          await runFfmpeg([
+            "-y",
+            "-threads",
+            "1",
+            "-i",
+            dest,
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            aacPath,
+          ]);
+          await fs.unlink(dest).catch(() => undefined);
+          audioFiles.push({
+            path: aacPath,
+            offsetMs: Number(t.offsetMs) || 0,
+            name: t.name || `track${i}`,
+          });
+        } catch {
+          audioFiles.push({
+            path: dest,
+            offsetMs: Number(t.offsetMs) || 0,
+            name: t.name || `track${i}`,
+          });
+        }
       } catch (err) {
         console.warn("[render] audio download skip", t.url, err?.message);
       }
     }
     job.progress = 45;
 
-    const laserFilter = buildLaserFilter(events || [], totalSec);
+    const laserFilter =
+      ENABLE_LASERS && events?.length ? buildLaserFilter(events, totalSec) : "";
 
     const silentPath = join(workDir, "silent.mp4");
-    const vf = [
-      `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease`,
-      `pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2`,
-      "format=yuv420p",
-      `fps=${OUT_FPS}`,
-      laserFilter,
-    ]
-      .filter(Boolean)
-      .join(",");
+    // Images already at OUT_WxOUT_H — keep vf tiny
+    const vf = ["format=yuv420p", `fps=${OUT_FPS}`, laserFilter].filter(Boolean).join(",");
 
     await runFfmpeg([
       "-y",
       "-threads",
-      String(FFMPEG_THREADS),
+      "1",
+      "-filter_threads",
+      "1",
+      "-filter_complex_threads",
+      "1",
       "-f",
       "concat",
       "-safe",
       "0",
       "-i",
       listPath,
-      "-vf",
-      vf,
+      ...(vf ? ["-vf", vf] : []),
       "-c:v",
       "libx264",
-      // ultrafast + higher CRF = much less RAM/CPU on free instances
       "-preset",
-      process.env.FFMPEG_PRESET || "ultrafast",
+      PRESET,
       "-crf",
-      process.env.FFMPEG_CRF || "28",
+      CRF,
+      "-tune",
+      "stillimage",
       "-pix_fmt",
       "yuv420p",
+      "-g",
+      String(OUT_FPS * 2),
+      "-bf",
+      "0",
+      "-refs",
+      "1",
+      "-x264-params",
+      "threads=1:sliced-threads=0:sync-lookahead=0:rc-lookahead=0:scenecut=0",
       "-movflags",
       "+faststart",
       "-an",
@@ -229,33 +265,29 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     ]);
     job.progress = 70;
 
+    // Free scaled JPEGs before mix
+    for (const f of localFiles) {
+      await fs.unlink(f.path).catch(() => undefined);
+    }
+
     const outPath = join(workDir, "quickshare.mp4");
 
     if (audioFiles.length === 0) {
-      await fs.copyFile(silentPath, outPath);
+      await fs.rename(silentPath, outPath).catch(async () => {
+        await fs.copyFile(silentPath, outPath);
+        await fs.unlink(silentPath).catch(() => undefined);
+      });
     } else {
-      const args = ["-y", "-threads", String(FFMPEG_THREADS), "-i", silentPath];
-      for (const a of audioFiles) {
-        args.push("-i", a.path);
-      }
-
-      const n = audioFiles.length;
-      const filters = [];
-      const mixInputs = [];
-      for (let i = 0; i < n; i += 1) {
-        const delay = Math.max(0, audioFiles[i].offsetMs);
-        filters.push(
-          `[${i + 1}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${delay}|${delay},volume=1.0[a${i}]`,
-        );
-        mixInputs.push(`[a${i}]`);
-      }
-      filters.push(
-        `${mixInputs.join("")}amix=inputs=${n}:duration=first:dropout_transition=0:normalize=0[aout]`,
-      );
-
-      args.push(
+      const args = [
+        "-y",
+        "-threads",
+        "1",
+        "-i",
+        silentPath,
+        "-i",
+        audioFiles[0].path,
         "-filter_complex",
-        filters.join(";"),
+        `[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=mono,adelay=${Math.max(0, audioFiles[0].offsetMs)}|${Math.max(0, audioFiles[0].offsetMs)},volume=1.0[aout]`,
         "-map",
         "0:v:0",
         "-map",
@@ -265,19 +297,24 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "96k",
+        "-ac",
+        "1",
         "-shortest",
         "-movflags",
         "+faststart",
         outPath,
-      );
-
+      ];
       try {
         await runFfmpeg(args);
+        await fs.unlink(silentPath).catch(() => undefined);
       } catch (err) {
         console.warn("[render] audio mix failed, shipping silent", err?.message);
-        await fs.copyFile(silentPath, outPath);
+        await fs.rename(silentPath, outPath).catch(async () => {
+          await fs.copyFile(silentPath, outPath);
+        });
       }
+      for (const a of audioFiles) await fs.unlink(a.path).catch(() => undefined);
     }
 
     job.progress = 90;
@@ -285,8 +322,9 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     job.byteSize = stat.size;
 
     if (callbackUrl) {
-      // Buffer upload (reliable on free tiers; files are small at 720p)
       const fileBuf = await fs.readFile(outPath);
+      // free file ASAP after read
+      await fs.unlink(outPath).catch(() => undefined);
       const headers = {
         "Content-Type": "video/mp4",
         "Content-Length": String(fileBuf.byteLength),
@@ -328,7 +366,24 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
   }
 }
 
-/** Build ffmpeg drawbox chain for laser spots/strokes (approx). */
+/** Scale one image to output size with low-thread ffmpeg; writes JPEG. */
+function scaleImageLowMem(inputPath, outputPath) {
+  return runFfmpeg([
+    "-y",
+    "-threads",
+    "1",
+    "-i",
+    inputPath,
+    "-vf",
+    `scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2,format=yuvj420p`,
+    "-frames:v",
+    "1",
+    "-q:v",
+    "5",
+    outputPath,
+  ]);
+}
+
 function buildLaserFilter(events, totalSec) {
   const parts = [];
   const pointers = events.filter((e) => e.type === "pointer_stroke");
@@ -342,29 +397,15 @@ function buildLaserFilter(events, totalSec) {
     const pts = Array.isArray(p.points) && p.points.length ? p.points : null;
     const xN = Number(p.x ?? pts?.[0]?.x ?? 0.5);
     const yN = Number(p.y ?? pts?.[0]?.y ?? 0.5);
-    if (p.mode === "draw" && pts && pts.length > 1) {
-      const step = Math.max(1, Math.floor(pts.length / 4));
-      for (let i = 0; i < pts.length && count < MAX_LASERS; i += step) {
-        const pt = pts[i];
-        const bx = Math.max(0, Math.min(OUT_W - 24, Math.round(Number(pt.x) * OUT_W - 12)));
-        const by = Math.max(0, Math.min(OUT_H - 24, Math.round(Number(pt.y) * OUT_H - 12)));
-        const t1 = Math.min(totalSec, t0 + 0.55);
-        parts.push(
-          `drawbox=x=${bx}:y=${by}:w=24:h=24:color=${color}@0.75:t=fill:enable='between(t\\,${t0.toFixed(3)}\\,${t1.toFixed(3)})'`,
-        );
-        count += 1;
-      }
-    } else {
-      const boxW = Math.round(OUT_W * 0.08);
-      const boxH = Math.round(OUT_H * 0.08);
-      const bx = Math.max(0, Math.min(OUT_W - boxW, Math.round(xN * OUT_W - boxW / 2)));
-      const by = Math.max(0, Math.min(OUT_H - boxH, Math.round(yN * OUT_H - boxH / 2)));
-      const t1 = Math.min(totalSec, t0 + 0.45);
-      parts.push(
-        `drawbox=x=${bx}:y=${by}:w=${boxW}:h=${boxH}:color=${color}@0.35:t=4:enable='between(t\\,${t0.toFixed(3)}\\,${t1.toFixed(3)})'`,
-      );
-      count += 1;
-    }
+    const boxW = Math.round(OUT_W * 0.1);
+    const boxH = Math.round(OUT_H * 0.1);
+    const bx = Math.max(0, Math.min(OUT_W - boxW, Math.round(xN * OUT_W - boxW / 2)));
+    const by = Math.max(0, Math.min(OUT_H - boxH, Math.round(yN * OUT_H - boxH / 2)));
+    const t1 = Math.min(totalSec, t0 + 0.4);
+    parts.push(
+      `drawbox=x=${bx}:y=${by}:w=${boxW}:h=${boxH}:color=${color}@0.35:t=3:enable='between(t\\,${t0.toFixed(3)}\\,${t1.toFixed(3)})'`,
+    );
+    count += 1;
   }
   return parts.join(",");
 }
@@ -388,10 +429,10 @@ function normalizeSlides(slides) {
       else if (sorted[i + 1] && sorted[i + 1].startMs != null) {
         durationSec = (Number(sorted[i + 1].startMs) - start) / 1000;
       } else {
-        durationSec = 4;
+        durationSec = 3.5;
       }
     }
-    durationSec = Math.min(30, Math.max(1.2, durationSec));
+    durationSec = Math.min(20, Math.max(1.2, durationSec));
     return { url: s.url, durationSec, caption: s.caption || "" };
   });
 }
@@ -409,7 +450,7 @@ function guessExt(url) {
 
 async function downloadToFile(url, dest) {
   const res = await fetch(url, {
-    headers: { "User-Agent": "retold-render/1.2" },
+    headers: { "User-Agent": "retold-render/1.3" },
     redirect: "follow",
   });
   if (!res.ok) throw new Error(`download failed ${res.status} ${url}`);
@@ -420,18 +461,18 @@ async function downloadToFile(url, dest) {
 
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args, {
-      stdio: ["ignore", "pipe", "pipe"],
+    const proc = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", ...args], {
+      stdio: ["ignore", "ignore", "pipe"],
       env: {
         ...process.env,
-        // Keep ffmpeg from spawning huge thread pools
-        OMP_NUM_THREADS: String(FFMPEG_THREADS),
+        OMP_NUM_THREADS: "1",
+        OPENBLAS_NUM_THREADS: "1",
       },
     });
     let err = "";
     proc.stderr.on("data", (d) => {
       err += d.toString();
-      if (err.length > 8000) err = err.slice(-6000);
+      if (err.length > 4000) err = err.slice(-3000);
     });
     proc.on("error", reject);
     proc.on("close", (code, signal) => {
@@ -439,11 +480,11 @@ function runFfmpeg(args) {
       else if (signal === "SIGKILL" || code === 137) {
         reject(
           new Error(
-            "ffmpeg killed (exit 137) — usually out of memory on free Render plans. Retry or upgrade RAM.",
+            "ffmpeg OOM-killed (512Mi free plan). Video was too heavy — try fewer photos or upgrade Render RAM.",
           ),
         );
       } else {
-        reject(new Error(`ffmpeg exit ${code}: ${err.slice(-900)}`));
+        reject(new Error(`ffmpeg exit ${code}: ${err.slice(-700)}`));
       }
     });
   });
@@ -451,6 +492,6 @@ function runFfmpeg(args) {
 
 app.listen(PORT, () => {
   console.log(
-    `[retold-render] listening on :${PORT} out=${OUT_W}x${OUT_H}@${OUT_FPS} threads=${FFMPEG_THREADS}`,
+    `[retold-render] :${PORT} out=${OUT_W}x${OUT_H}@${OUT_FPS} lasers=${ENABLE_LASERS} maxSlides=${MAX_SLIDES}`,
   );
 });
