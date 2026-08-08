@@ -42,6 +42,7 @@ const RENDER_HOOK_KEY = process.env.RENDER_HOOK_KEY || "";
 const jobs = new Map();
 let chain = Promise.resolve();
 let activeJobs = 0;
+let runningJob = null;
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -71,6 +72,29 @@ app.get("/jobs/:id", (req, res) => {
     videoUrl: job.videoUrl,
     byteSize: job.byteSize,
   });
+});
+
+app.post("/jobs/:id/cancel", (req, res) => {
+  if (!RENDER_HOOK_KEY || bearer(req) !== RENDER_HOOK_KEY) {
+    return res.status(403).json({ error: "bad render hook key" });
+  }
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "not found" });
+  if (job.status === "ready") return res.status(409).json({ error: "already finished" });
+  if (job.status === "canceled") return res.json({ id: job.id, status: job.status, already: true });
+
+  job.cancelled = true;
+  job.status = "canceled";
+  job.error = null;
+  job.abortController.abort();
+  for (const proc of job.processes) {
+    try { proc.kill("SIGTERM"); } catch { /* already exited */ }
+    setTimeout(() => {
+      try { if (proc.exitCode === null) proc.kill("SIGKILL"); } catch { /* already exited */ }
+    }, 1500).unref();
+  }
+  console.log("[render] canceled", job.id);
+  return res.json({ id: job.id, status: job.status });
 });
 
 function bearer(req) {
@@ -202,6 +226,9 @@ app.post("/render", async (req, res) => {
     error: null,
     videoUrl: null,
     byteSize: null,
+    cancelled: false,
+    processes: new Set(),
+    abortController: new AbortController(),
   };
   jobs.set(id, job);
   if (jobs.size > 30) {
@@ -218,6 +245,11 @@ app.post("/render", async (req, res) => {
   chain = chain
     .then(() => runJob(job, { slides, audioTracks, events, callbackUrl, callbackSecret }))
     .catch(async (err) => {
+      if (job.cancelled || err?.code === "RENDER_CANCELED") {
+        job.status = "canceled";
+        job.error = null;
+        return;
+      }
       job.status = "failed";
       job.error = err instanceof Error ? err.message : String(err);
       console.error("[render] job failed", id, job.error);
@@ -228,7 +260,9 @@ app.post("/render", async (req, res) => {
 });
 
 async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackSecret }) {
+  assertNotCanceled(job);
   activeJobs += 1;
+  runningJob = job;
   job.status = "rendering";
   job.progress = 5;
   const workDir = join(tmpdir(), `retold-${job.id}`);
@@ -255,10 +289,12 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       const s = timed[i];
       const rawPath = join(workDir, `raw-${String(i).padStart(3, "0")}.img`);
       const scaledPath = join(workDir, `slide-${String(i).padStart(3, "0")}.jpg`);
-      await downloadToFile(s.url, rawPath);
+      await downloadToFile(s.url, rawPath, job.abortController.signal);
+      assertNotCanceled(job);
       const box = await probeContainedImageBox(rawPath, OUT_W, OUT_H);
       slideBoxes.set(Number(s.position ?? s.photoPosition ?? i), box);
       await scaleImageLowMem(rawPath, scaledPath);
+      assertNotCanceled(job);
       await fs.unlink(rawPath).catch(() => undefined);
       localFiles.push({ path: scaledPath, durationSec: s.durationSec });
       job.progress = 8 + Math.floor((i / timed.length) * 30);
@@ -285,7 +321,8 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     for (let i = 0; i < tracks.length; i += 1) {
       const t = tracks[i];
       try {
-        const prepared = await prepareAudioTrack(workDir, t, i);
+        const prepared = await prepareAudioTrack(workDir, t, i, job);
+        assertNotCanceled(job);
         if (prepared) audioFiles.push(prepared);
       } catch (err) {
         console.warn("[render] audio track skip", t?.name || i, err?.message);
@@ -344,6 +381,7 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       String(Math.max(1, totalSec)),
       silentPath,
     ]);
+    assertNotCanceled(job);
     job.progress = 70;
 
     // Free scaled JPEGs before mix
@@ -397,6 +435,7 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
       );
       try {
         await runFfmpeg(args);
+        assertNotCanceled(job);
         await fs.unlink(silentPath).catch(() => undefined);
       } catch (err) {
         console.warn("[render] audio mix failed, shipping silent", err?.message);
@@ -412,6 +451,7 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     job.byteSize = stat.size;
 
     if (callbackUrl) {
+      assertNotCanceled(job);
       const fileBuf = await fs.readFile(outPath);
       // free file ASAP after read
       await fs.unlink(outPath).catch(() => undefined);
@@ -430,7 +470,9 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
         method: "POST",
         headers,
         body: fileBuf,
+        signal: job.abortController.signal,
       });
+      assertNotCanceled(job);
       if (!up.ok) {
         const t = await up.text().catch(() => "");
         throw new Error(`callback failed ${up.status}: ${t.slice(0, 200)}`);
@@ -452,11 +494,19 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     );
   } finally {
     activeJobs = Math.max(0, activeJobs - 1);
+    if (runningJob === job) runningJob = null;
     fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
-async function prepareAudioTrack(workDir, track, index) {
+function assertNotCanceled(job) {
+  if (!job?.cancelled) return;
+  const error = new Error("render canceled");
+  error.code = "RENDER_CANCELED";
+  throw error;
+}
+
+async function prepareAudioTrack(workDir, track, index, job) {
   const chunks = (Array.isArray(track?.chunks) ? track.chunks : [])
     .filter((chunk) => chunk?.url)
     .sort((a, b) => (Number(a.sequence) || 0) - (Number(b.sequence) || 0));
@@ -466,7 +516,8 @@ async function prepareAudioTrack(workDir, track, index) {
     const localChunks = [];
     for (let i = 0; i < chunks.length; i += 1) {
       const path = join(workDir, `audio-${index}-chunk-${String(i).padStart(3, "0")}.bin`);
-      await downloadToFile(chunks[i].url, path);
+      await downloadToFile(chunks[i].url, path, job.abortController.signal);
+      assertNotCanceled(job);
       localChunks.push({ path, offsetMs: Math.max(0, Number(chunks[i].offsetMs) || 0) });
     }
 
@@ -498,7 +549,8 @@ async function prepareAudioTrack(workDir, track, index) {
 
   if (!track?.url) return null;
   const rawPath = join(workDir, `audio-${index}.raw`);
-  await downloadToFile(track.url, rawPath);
+  await downloadToFile(track.url, rawPath, job.abortController.signal);
+  assertNotCanceled(job);
   try {
     await runFfmpeg([
       "-y", "-threads", "1", "-i", rawPath, "-vn",
@@ -812,15 +864,16 @@ function guessExt(url) {
   return "jpg";
 }
 
-async function downloadToFile(url, dest) {
+async function downloadToFile(url, dest, signal) {
   const res = await fetch(url, {
     headers: { "User-Agent": "retold-render/1.3" },
     redirect: "follow",
+    signal,
   });
   if (!res.ok) throw new Error(`download failed ${res.status} ${url}`);
   const body = res.body;
   if (!body) throw new Error("empty body");
-  await pipeline(Readable.fromWeb(body), createWriteStream(dest));
+  await pipeline(Readable.fromWeb(body), createWriteStream(dest), { signal });
 }
 
 async function notifyFailure(callbackUrl, callbackSecret, error) {
@@ -845,6 +898,11 @@ function runFfmpeg(args) {
         OPENBLAS_NUM_THREADS: "1",
       },
     });
+    const owner = runningJob;
+    if (owner) {
+      owner.processes.add(proc);
+      if (owner.cancelled) proc.kill("SIGTERM");
+    }
     let err = "";
     proc.stderr.on("data", (d) => {
       err += d.toString();
@@ -852,6 +910,7 @@ function runFfmpeg(args) {
     });
     proc.on("error", reject);
     proc.on("close", (code, signal) => {
+      owner?.processes.delete(proc);
       if (code === 0) resolve();
       else if (signal === "SIGKILL" || code === 137) {
         reject(
