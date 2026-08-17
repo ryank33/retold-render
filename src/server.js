@@ -26,9 +26,11 @@ const PORT = Number(process.env.PORT || 10000);
 const OUT_W = Math.min(1920, Math.max(480, Number(process.env.RENDER_WIDTH || 1280)));
 const OUT_H = Math.min(1080, Math.max(270, Number(process.env.RENDER_HEIGHT || 720)));
 const OUT_FPS = Math.min(30, Math.max(10, Number(process.env.RENDER_FPS || 24)));
-const MAX_SLIDES = Math.min(80, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 40)));
-const MAX_TOTAL_SEC = Math.min(600, Math.max(20, Number(process.env.RENDER_MAX_SEC || 180)));
-const MAX_LASERS = Math.min(80, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 40)));
+// Real family sessions run well past 3 minutes with hundreds of pointer
+// marks, so the defaults are sized for that; env vars can still override.
+const MAX_SLIDES = Math.min(200, Math.max(1, Number(process.env.RENDER_MAX_SLIDES || 100)));
+const MAX_TOTAL_SEC = Math.min(3600, Math.max(20, Number(process.env.RENDER_MAX_SEC || 1800)));
+const MAX_LASERS = Math.min(2000, Math.max(0, Number(process.env.RENDER_MAX_LASERS || 400)));
 const ENABLE_LASERS =
   process.env.RENDER_LASERS === undefined ||
   process.env.RENDER_LASERS === "" ||
@@ -62,6 +64,9 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/jobs/:id", (req, res) => {
+  if (!RENDER_HOOK_KEY || bearer(req) !== RENDER_HOOK_KEY) {
+    return res.status(403).json({ error: "bad render hook key" });
+  }
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "not found" });
   res.json({
@@ -184,11 +189,14 @@ function normalizeManifestEvents(events) {
 }
 
 app.post("/render", async (req, res) => {
-  const rawBody = req.body || {};
-  const isManifestJob = !!rawBody.manifest;
-  if (isManifestJob && (!RENDER_HOOK_KEY || bearer(req) !== RENDER_HOOK_KEY)) {
+  // Every render request must present the shared hook key — including the
+  // legacy (non-manifest) payload shape. This service downloads caller-supplied
+  // URLs and posts callbacks, so an unauthenticated path is an SSRF/abuse hole.
+  if (!RENDER_HOOK_KEY || bearer(req) !== RENDER_HOOK_KEY) {
     return res.status(403).json({ error: "bad render hook key" });
   }
+  const rawBody = req.body || {};
+  const isManifestJob = !!rawBody.manifest;
 
   const body = isManifestJob ? adaptManifestJob(rawBody) : rawBody;
   const {
@@ -272,15 +280,32 @@ async function runJob(job, { slides, audioTracks, events, callbackUrl, callbackS
     let timed = normalizeSlides(slides).slice(0, MAX_SLIDES);
     let totalSec = timed.reduce((a, s) => a + s.durationSec, 0);
     if (totalSec > MAX_TOTAL_SEC) {
-      const scale = MAX_TOTAL_SEC / totalSec;
-      timed = timed.map((s) => ({
-        ...s,
-        durationSec: Math.max(1.2, s.durationSec * scale),
-      }));
+      // TRUNCATE, never rescale. Rescaling slide timings while audio chunks
+      // and pointer events keep their master-clock offsets desynchronizes the
+      // entire video. Cutting at the cap keeps everything before it accurate.
+      const capped = [];
+      let acc = 0;
+      for (const s of timed) {
+        if (acc >= MAX_TOTAL_SEC) break;
+        const remaining = MAX_TOTAL_SEC - acc;
+        capped.push(remaining < s.durationSec ? { ...s, durationSec: remaining } : s);
+        acc += s.durationSec;
+      }
+      timed = capped;
       totalSec = timed.reduce((a, s) => a + s.durationSec, 0);
-      console.warn("[render] capped duration to", totalSec.toFixed(1), "s");
+      console.warn(
+        "[render] session exceeds cap; truncated to", totalSec.toFixed(1),
+        `s (raise RENDER_MAX_SEC, currently ${MAX_TOTAL_SEC}s, to render the full session)`,
+      );
     }
     job.progress = 8;
+
+    console.log(
+      `[render] job ${job.id}: slides=${timed.length} totalSec=${totalSec.toFixed(1)}`
+      + ` tracks=${(audioTracks || []).length}`
+      + ` chunks=${(audioTracks || []).reduce((a, t) => a + (t.chunks?.length || 0), 0)}`
+      + ` events=${(events || []).length}`,
+    );
 
     // Download + pre-scale one image at a time (never feed multi-MP source into encoder)
     const localFiles = [];
@@ -643,6 +668,8 @@ function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map())
   const lines = [];
   let drawBudget = MAX_LASERS * 4;
   let spotBudget = MAX_LASERS * 2;
+  let droppedDraws = 0;
+  let droppedSpots = 0;
   const fullFrame = { offX: 0, offY: 0, width, height };
 
   function boxFor(payload) {
@@ -670,7 +697,7 @@ function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map())
     const box = boxFor(p);
 
     if (mode === "spotlight") {
-      if (spotBudget <= 0) continue;
+      if (spotBudget <= 0) { droppedSpots += 1; continue; }
       spotBudget -= 1;
       const point = pointInBox(pts[pts.length - 1] || { x: p.x, y: p.y }, box);
       if (!point) continue;
@@ -683,25 +710,21 @@ function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map())
       const replacedAt = nextForActor ? Number(nextForActor.timestamp || 0) / 1000 : Infinity;
       const t1 = Math.min(totalSec + 0.2, t0 + 0.7, replacedAt);
       if (t1 <= t0) continue;
-      const radius = Math.max(38, Math.min(box.width, box.height) * 0.11);
-      const glowPath = circlePath(point.x, point.y, radius);
-      const midPath = circlePath(point.x, point.y, radius * 0.58);
-      const coreSize = Math.max(12, Math.round(radius * 0.38));
+      // Laser pointer: a small bright dot (GoodNotes-style), matching the
+      // browser — not a wide spotlight glow.
+      const radius = Math.max(8, Math.min(box.width, box.height) * 0.018);
+      const glowPath = circlePath(point.x, point.y, radius * 2.2);
+      const corePath = circlePath(point.x, point.y, radius);
       const fadeMs = Math.max(1, Math.round((t1 - t0) * 1000));
-      // Three layers approximate the browser's radial glow without leaving
-      // a trail of overlapping rings as pointermove events arrive.
       lines.push(
-        assDrawing(t0, t1, glowPath, color, "C8", fadeMs),
-        assDrawing(t0, t1, midPath, color, "D8", fadeMs),
-      );
-      lines.push(
-        `Dialogue: 1,${formatAssTime(t0)},${formatAssTime(t1)},Laser,,0,0,0,,{\\an5\\pos(${point.x},${point.y})\\fs${coreSize}\\bord2\\shad0\\1c${color}\\3c${color}\\1a&H50&\\3a&H20&\\fad(0,${fadeMs})}○`,
+        assDrawing(t0, t1, glowPath, color, "B0", fadeMs),
+        assDrawing(t0, t1, corePath, color, "08", fadeMs, 1),
       );
       continue;
     }
 
     // Draw trail — stroke only (never fill the polygon)
-    if (drawBudget <= 0) continue;
+    if (drawBudget <= 0) { droppedDraws += 1; continue; }
     const rawPts =
       pts.length >= 2
         ? pts
@@ -739,6 +762,16 @@ function buildAssLasers(events, totalSec, width, height, slideBoxes = new Map())
       ...coreShapes.map((shape) => assDrawing(t0, t1, shape, color, "10", 700, 1)),
     );
   }
+
+  // Never truncate silently — a dropped mark is a bug report waiting to happen.
+  if (droppedDraws || droppedSpots) {
+    console.warn(
+      `[render] LASER BUDGET EXCEEDED: dropped ${droppedDraws} draw + ${droppedSpots} laser events`
+      + ` (budget ${MAX_LASERS * 4}/${MAX_LASERS * 2} from RENDER_MAX_LASERS=${MAX_LASERS}); raise the env var`,
+    );
+  }
+  console.log(`[render] lasers: ${pointers.length} pointer events → ${lines.length} subtitle lines`
+    + ` (dropped ${droppedDraws + droppedSpots})`);
 
   return [
     "[Script Info]",
@@ -816,7 +849,7 @@ function clamp01(n) {
 /** #RRGGBB → ASS &H00BBGGRR */
 function hexToAss(hex) {
   const m = String(hex).match(/^#?([0-9a-fA-F]{6})$/);
-  if (!m) return "&H00F5C542";
+  if (!m) return "&H00303BFF";   // default: laser red #FF3B30
   const rr = m[1].slice(0, 2);
   const gg = m[1].slice(2, 4);
   const bb = m[1].slice(4, 6);
