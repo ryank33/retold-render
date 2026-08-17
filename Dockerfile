@@ -17,10 +17,10 @@ ENV NODE_OPTIONS=--max-old-space-size=768
 ENV RENDER_WIDTH=1280
 ENV RENDER_HEIGHT=720
 ENV RENDER_FPS=24
-ENV RENDER_MAX_SLIDES=40
-ENV RENDER_MAX_SEC=180
+# Session/laser caps intentionally NOT set here: src/server.js carries the
+# defaults (1800s, 100 slides, 400-laser budget) so a code change is enough
+# to tune them. Set env vars in the dashboard only to deliberately override.
 ENV RENDER_LASERS=1
-ENV RENDER_MAX_LASERS=40
 ENV FFMPEG_PRESET=veryfast
 ENV FFMPEG_CRF=23
 EXPOSE 10000
